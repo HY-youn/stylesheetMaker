@@ -466,6 +466,7 @@
     border: 1px solid color-mix(in oklab, var(--err) 40%, var(--line));
     color: color-mix(in oklab, var(--err) 70%, var(--ink));
     border-radius: var(--r-md); padding: 16px 18px; font-size: 0.88rem;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.55;
   }
 
   /* ---------- dialog ---------- */
@@ -1419,45 +1420,86 @@
     var fail = function (msg) { renderError(msg, payload); };
 
     if (url) {
+      var ctrl = null, timer = null;
+      try {
+        ctrl = new AbortController();
+        timer = setTimeout(function () { ctrl.abort(); }, 120000); // 이미지 생성 여유 2분
+      } catch (e) {}
+
       fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal: ctrl ? ctrl.signal : undefined
       }).then(function (res) {
+        if (timer) clearTimeout(timer);
         var ct = (res.headers.get("Content-Type") || "").toLowerCase();
+        var coreHdr = res.headers.get("X-Core-Output") || res.headers.get("x-core-output") || "";
+        var core = coreHdr ? decodeCoreHeader(coreHdr) : "";
 
-        // success contract: binary image body (+ optional X-Core-Output header)
-        if (res.ok && ct.indexOf("image/") === 0) {
-          var coreHdr = res.headers.get("X-Core-Output") || res.headers.get("x-core-output") || "";
-          return res.blob().then(function (blob) {
-            done({
-              core_output: coreHdr ? decodeCoreHeader(coreHdr) : "",
-              image_blob: blob,
-              image_type: blob.type || ct || "image/png",
-              image_url: ""
-            });
-          });
-        }
+        return res.arrayBuffer().then(function (buf) {
+          var bytes = new Uint8Array(buf);
+          var sniff = sniffImage(bytes);
 
-        // otherwise treat as JSON — either an error envelope or a URL/base64 fallback
-        return res.text().then(function (txt) {
+          // 1) 성공: 바이너리 이미지 (Content-Type이 맞든, 라벨이 틀렸든 매직바이트로 판별)
+          if (res.ok && (ct.indexOf("image/") === 0 || sniff)) {
+            var t = sniff || ct || "image/png";
+            done({ core_output: core, image_blob: new Blob([buf], { type: t }), image_type: t, image_url: "" });
+            return;
+          }
+
+          // 2) 그 외: 본문을 텍스트로 해석 (에러 메시지 / JSON 봉투)
+          var txt = "";
+          try { txt = new TextDecoder("utf-8").decode(bytes); } catch (e) { txt = ""; }
           var data = null;
           try { data = JSON.parse(txt); } catch (e) {}
-          if (!res.ok || (data && (data.error || data.message && !data.image_url && !data.image_base64))) {
-            throw new Error(
-              (data && (data.error || data.message)) ||
-              ("서버가 " + res.status + " 응답을 반환했습니다.")
-            );
+
+          if (data) {
+            var norm = normalizeResponse(data);
+            if (norm.image_url || norm.core_output) {
+              if (!norm.core_output) norm.core_output = core;
+              done(norm);
+              return;
+            }
+            var m = data.error || data.message || (data.json && (data.json.error || data.json.message));
+            throw new Error("n8n 응답에 이미지가 없습니다" + (m ? " — " + m : "") +
+              ". 받은 JSON: " + txt.slice(0, 200));
           }
-          if (!data) throw new Error("이미지가 아닌 응답을 받았습니다. Respond to Webhook 노드가 바이너리 이미지를 반환하는지 확인하세요.");
-          done(normalizeResponse(data));
+
+          if (!res.ok) {
+            throw new Error("서버가 " + res.status + " 응답. 본문: " + (txt.slice(0, 200) || "(빈 응답)"));
+          }
+          throw new Error(
+            "이미지가 아닌 응답입니다 (Content-Type: " + (ct || "없음") +
+            ", 본문 " + bytes.length + "바이트). 앞부분: " + (txt.slice(0, 160) || "(비어 있음)")
+          );
         });
       }).catch(function (err) {
-        fail(err && err.message ? err.message : "요청을 보내지 못했습니다. 네트워크와 CORS 설정을 확인하세요.");
+        if (timer) clearTimeout(timer);
+        var msg = err && err.message ? err.message : "";
+        if (err && err.name === "AbortError") msg = "응답이 2분 안에 오지 않아 중단했습니다. n8n 실행 로그를 확인하세요.";
+        if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+          msg = "요청을 보내지 못했습니다 (네트워크/CORS). n8n Webhook의 Allowed Origins에 이 사이트 주소가 있는지, URL이 맞는지 확인하세요.";
+        }
+        fail(msg || "알 수 없는 오류로 요청에 실패했습니다.");
       });
     } else {
       setTimeout(function () { done(demoResult(payload)); }, 900);
     }
+  }
+
+  // 응답 앞부분 바이트로 이미지 포맷 판별 (n8n이 Content-Type을 안 붙이거나 octet-stream으로 줄 때 대비)
+  function sniffImage(b) {
+    if (!b || b.length < 4) return "";
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return "image/png";
+    if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return "image/jpeg";
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x38) return "image/gif";
+    if (b.length >= 12 && b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46 &&
+        b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return "image/webp";
+    var head = "";
+    for (var i = 0; i < Math.min(b.length, 80); i++) head += String.fromCharCode(b[i]);
+    if (/^[﻿\s]*<(\?xml|svg)[\s>]/i.test(head)) return "image/svg+xml";
+    return "";
   }
 
   // X-Core-Output header carries the stylesheet text as UTF-8 base64
@@ -1473,15 +1515,28 @@
     if (Array.isArray(data)) data = data[0] || {};
     data = data || {};
     var d = data.json || data.body || data;
-    var b64 = d.image_base64 || d.imageBase64 || "";
-    var mime = d.mime || d.image_mime || "image/png";
+    var mime = d.mime || d.image_mime || d.mimeType || "image/png";
+
+    // 흔한 base64 위치들 (OpenAI images / gpt-image, n8n Set/Function 출력 등)
+    var b64 =
+      d.image_base64 || d.imageBase64 || d.b64_json || d.b64 ||
+      (typeof d.image === "string" ? d.image : "") ||
+      (typeof d.data === "string" ? d.data : "") ||
+      (d.data && d.data[0] && d.data[0].b64_json) ||
+      (d.binary && d.binary.data && d.binary.data.data) || "";
+
+    var url =
+      d.image_url || d.imageUrl || d.url ||
+      (d.data && d.data[0] && d.data[0].url) || "";
+
     var dataUrl = "";
-    if (b64) dataUrl = /^data:/.test(b64) ? b64 : "data:" + mime + ";base64," + b64;
+    if (b64) dataUrl = /^data:/.test(b64) ? b64 : "data:" + mime + ";base64," + String(b64).replace(/\s+/g, "");
+
     return {
       core_output: d.core_output || d.coreOutput || d.stylesheet || "",
       image_blob: null,
       image_type: mime,
-      image_url: d.image_url || d.imageUrl || dataUrl || ""
+      image_url: url || dataUrl || ""
     };
   }
 
