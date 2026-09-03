@@ -1,0 +1,15 @@
+{
+  "name": "saesomang-character-generator",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "새소망교회 캐릭터 생성기 — 20문항 → 캐릭터 스타일시트 + 인포그래픽 이미지 (n8n webhook)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^7.0.0"
+  }
+}
